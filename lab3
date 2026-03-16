@@ -1,0 +1,66 @@
+!pip -q install -U google-generativeai
+
+import google.generativeai as genai
+
+MY_API_KEY = "AIzaSyB1dyQVsSgTEeRZU_vOm9PI-UWW00FONhE"
+
+genai.configure(api_key=MY_API_KEY)
+
+BOT_INSTRUCTIONS = """
+Ти корисний і доброзичливий AI-асистент.
+Відповідай чітко, зрозуміло і по суті.
+Можеш відповідати тією мовою, якою до тебе звертаються.
+Якщо запит нечіткий, постав коротке уточнення.
+Для простих питань давай короткі відповіді, для складних — детальніші.
+Якщо доречно, наводь приклади.
+"""
+
+assistant_model = genai.GenerativeModel(
+    model_name="models/gemini-2.5-flash",
+    system_instruction=BOT_INSTRUCTIONS
+)
+
+dialog = assistant_model.start_chat(history=[])
+
+
+def send_message_to_bot(text):
+    reply = dialog.send_message(text)
+    return reply.text.strip()
+
+
+def show_commands():
+    print("\nДоступні команди:")
+    print("/new   - почати новий діалог")
+    print("/quit  - завершити програму")
+
+
+def main():
+    global dialog
+
+    print("AI-чат запущено.")
+    show_commands()
+
+    while True:
+        user_input = input("Користувач: ").strip()
+
+        if user_input == "":
+            continue
+
+        if user_input == "/new":
+            dialog = assistant_model.start_chat(history=[])
+            print("Новий діалог створено.\n")
+            continue
+
+        if user_input == "/quit":
+            print("Програму завершено.")
+            break
+
+        try:
+            bot_answer = send_message_to_bot(user_input)
+            print("Бот:", bot_answer, "\n")
+        except Exception as err:
+            print("Сталася помилка:", err, "\n")
+
+
+if __name__ == "__main__":
+    main()
