@@ -1,0 +1,313 @@
+import os
+import cv2
+import numpy as np
+import tensorflow as tf
+import tensorflow_datasets as tfds
+import matplotlib.pyplot as plt
+from google.colab import files
+
+# Налаштування
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+tf.random.set_seed(RANDOM_STATE)
+
+BATCH = 128
+EPOCH_COUNT = 3
+VALID_PART = 0.1
+IMG_DIM = 28
+
+DATASET = "emnist/byclass"
+SAVE_MODEL = "/content/ocr_emnist_model.keras"
+
+# Підготовка даних
+def preprocess(sample):
+    """
+    Нормалізація та виправлення орієнтації зображень EMNIST
+    """
+    image = tf.cast(sample["image"], tf.float32) / 255.0
+    image = tf.image.transpose(image)
+    label = sample["label"]
+    return image, label
+
+
+def load_datasets():
+    """
+    Завантаження датасету та створення train/val/test
+    """
+    train_raw = tfds.load(DATASET, split="train", shuffle_files=True)
+    test_raw = tfds.load(DATASET, split="test", shuffle_files=False)
+
+    info = tfds.builder(DATASET).info
+    train_size = info.splits["train"].num_examples
+    val_size = int(train_size * VALID_PART)
+
+    train_raw = train_raw.shuffle(10000, seed=RANDOM_STATE)
+
+    val_ds = train_raw.take(val_size)
+    train_ds = train_raw.skip(val_size)
+
+    AUTOTUNE = tf.data.AUTOTUNE
+
+    train_ds = train_ds.map(preprocess, num_parallel_calls=AUTOTUNE).batch(BATCH).prefetch(AUTOTUNE)
+    val_ds = val_ds.map(preprocess, num_parallel_calls=AUTOTUNE).batch(BATCH).prefetch(AUTOTUNE)
+    test_ds = test_raw.map(preprocess, num_parallel_calls=AUTOTUNE).batch(BATCH).prefetch(AUTOTUNE)
+
+    return train_ds, val_ds, test_ds, info
+
+# CNN модель
+def create_cnn_model(num_classes):
+    """
+    Побудова згорткової нейронної мережі
+    """
+    input_layer = tf.keras.Input(shape=(IMG_DIM, IMG_DIM, 1))
+
+    x = tf.keras.layers.Conv2D(32, 3, padding="same", activation="relu")(input_layer)
+    x = tf.keras.layers.MaxPooling2D()(x)
+
+    x = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+
+    x = tf.keras.layers.Conv2D(128, 3, padding="same", activation="relu")(x)
+    x = tf.keras.layers.MaxPooling2D()(x)
+
+    x = tf.keras.layers.Dropout(0.25)(x)
+    x = tf.keras.layers.Flatten()(x)
+
+    x = tf.keras.layers.Dense(256, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.35)(x)
+
+    output_layer = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+
+    model = tf.keras.Model(input_layer, output_layer)
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+
+    return model
+
+
+# Навчання
+def train_model():
+    train_ds, val_ds, test_ds, info = load_datasets()
+    num_classes = info.features["label"].num_classes
+
+    model = create_cnn_model(num_classes)
+
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_accuracy",
+            patience=2,
+            restore_best_weights=True
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            SAVE_MODEL,
+            monitor="val_accuracy",
+            save_best_only=True
+        )
+    ]
+
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCH_COUNT,
+        callbacks=callbacks
+    )
+
+    loss, acc = model.evaluate(test_ds, verbose=0)
+    print(f"\nTest accuracy: {acc:.4f}")
+
+    return model, info
+
+# Сегментація символів
+def extract_characters(image):
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    binary = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        21,
+        10
+    )
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(
+        binary,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+
+        if w * h < 150:
+            continue
+        if h < 15 or w < 8:
+            continue
+        if h / max(w, 1) > 10:
+            continue
+        if w / max(h, 1) > 5:
+            continue
+
+        boxes.append((x, y, w, h))
+
+    boxes = sorted(boxes, key=lambda b: (b[1] // 50, b[0]))
+
+    characters = []
+    for (x, y, w, h) in boxes:
+        char_img = binary[y:y+h, x:x+w]
+
+        h0, w0 = char_img.shape
+        size = max(h0, w0) + 12
+
+        pad_y = (size - h0) // 2
+        pad_x = (size - w0) // 2
+
+        square = cv2.copyMakeBorder(
+            char_img,
+            pad_y, size - h0 - pad_y,
+            pad_x, size - w0 - pad_x,
+            cv2.BORDER_CONSTANT,
+            value=0
+        )
+
+        resized = cv2.resize(square, (IMG_DIM, IMG_DIM))
+        normalized = (resized.astype(np.float32) / 255.0)[..., None]
+
+        characters.append((normalized, (x, y, w, h)))
+
+    return characters
+
+# Перетворення id у символ
+def id_to_char(i):
+    if i < 10:
+        return chr(i + 48)      # 0-9
+    elif i < 36:
+        return chr(i - 10 + 65) # A-Z
+    else:
+        return chr(i - 36 + 97) # a-z
+
+# Розпізнавання тексту
+def predict_text(model, img_path, conf_threshold=0.50):
+    image = cv2.imread(img_path)
+
+    if image is None:
+        raise FileNotFoundError("Image not found")
+
+    chars = extract_characters(image)
+
+    if len(chars) == 0:
+        return "", [], image
+
+    batch = np.stack([c[0] for c in chars])
+    probs = model.predict(batch, verbose=0)
+
+    ids = np.argmax(probs, axis=1)
+    conf = np.max(probs, axis=1)
+
+    result_chars = []
+    details = []
+
+    for (img_norm, box), idx, c in zip(chars, ids, conf):
+        ch = id_to_char(idx)
+
+        if c < conf_threshold:
+            ch = "?"
+
+        result_chars.append(ch)
+        details.append({
+            "char": ch,
+            "confidence": float(c),
+            "bbox": box
+        })
+
+    text = "".join(result_chars)
+    return text, details, image
+
+# Основна програма
+if __name__ == "__main__":
+    print("Current folder:", os.getcwd())
+    print("Model exists:", os.path.exists(SAVE_MODEL))
+    print("Model path:", SAVE_MODEL)
+
+    # 1. Завантаження або навчання моделі
+    if os.path.exists(SAVE_MODEL):
+        print("Loading trained model...")
+        model = tf.keras.models.load_model(SAVE_MODEL)
+    else:
+        print("Model not found. Training started...")
+        model, info = train_model()
+
+    # 2. Завантаження зображення 
+    print("\nUpload image for recognition:")
+    uploaded = files.upload()
+
+    if len(uploaded) == 0:
+        print("No file uploaded.")
+    else:
+        sample_name = list(uploaded.keys())[0]
+        sample_path = f"/content/{sample_name}"
+
+        print("Uploaded file:", sample_path)
+
+        text, details, img = predict_text(model, sample_path, conf_threshold=0.50)
+
+        print("\nDetected text:", text)
+        for d in details:
+            print(
+                f"Symbol: {d['char']} | "
+                f"Confidence: {d['confidence']:.2f} | "
+                f"Box: {d['bbox']}"
+            )
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        annotated = img_rgb.copy()
+
+        for d in details:
+            x, y, w, h = d["bbox"]
+
+            cv2.rectangle(
+                annotated,
+                (x, y),
+                (x + w, y + h),
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                annotated,
+                d["char"],
+                (x, max(y - 5, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 0, 0),
+                2
+            )
+
+        plt.figure(figsize=(12, 6))
+
+        plt.subplot(1, 2, 1)
+        plt.title("Original image")
+        plt.imshow(img_rgb)
+        plt.axis("off")
+
+        plt.subplot(1, 2, 2)
+        plt.title(f"Recognized: {text}")
+        plt.imshow(annotated)
+        plt.axis("off")
+
+        plt.tight_layout()
+        plt.show()
