@@ -1,0 +1,386 @@
+!pip -q install gtts pydub librosa soundfile
+
+import os
+import shutil
+import random
+import numpy as np
+import tensorflow as tf
+import librosa
+import soundfile as sf
+import matplotlib.pyplot as plt
+
+from gtts import gTTS
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
+from google.colab import files
+from IPython.display import Audio, display
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+SR = 16000
+BASE_DIR = "/content/nato_dataset"
+
+if os.path.exists(BASE_DIR):
+    shutil.rmtree(BASE_DIR)
+os.makedirs(BASE_DIR, exist_ok=True)
+
+TOKEN_TO_WORD = {
+    "A": "alfa", "B": "bravo", "C": "charlie", "D": "delta", "E": "echo",
+    "F": "foxtrot", "G": "golf", "H": "hotel", "I": "india", "J": "juliett",
+    "K": "kilo", "L": "lima", "M": "mike", "N": "november", "O": "oscar",
+    "P": "papa", "Q": "quebec", "R": "romeo", "S": "sierra", "T": "tango",
+    "U": "uniform", "V": "victor", "W": "whiskey", "X": "xray", "Y": "yankee",
+    "Z": "zulu", "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+    "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine"
+}
+
+WORD_TO_TOKEN = {v: k for k, v in TOKEN_TO_WORD.items()}
+CLASSES = list(TOKEN_TO_WORD.values())
+CLASS_TO_ID = {c: i for i, c in enumerate(CLASSES)}
+ID_TO_CLASS = {i: c for c, i in CLASS_TO_ID.items()}
+
+print("Класи:", CLASSES)
+print("Кількість класів:", len(CLASSES))
+
+TLDS = ["com", "co.uk", "com.au", "ca", "ie", "co.in"]
+
+def add_noise(y, level=0.003):
+    noise = np.random.randn(len(y)) * level
+    return np.clip(y + noise, -1.0, 1.0)
+
+def synthesize_base_word(word, out_wav, tld="com", slow=False):
+    mp3_path = out_wav.replace(".wav", ".mp3")
+    tts = gTTS(text=word, lang="en", tld=tld, slow=slow)
+    tts.save(mp3_path)
+
+    audio = AudioSegment.from_mp3(mp3_path).set_channels(1).set_frame_rate(SR)
+
+    if len(audio) > 900:
+        audio = audio[:900]
+
+    audio = AudioSegment.silent(duration=100) + audio + AudioSegment.silent(duration=100)
+    audio.export(out_wav, format="wav")
+
+    os.remove(mp3_path)
+
+def save_augmented_versions(wav_path):
+    y, sr = librosa.load(wav_path, sr=SR)
+    y = librosa.util.fix_length(y, size=SR)
+
+    sf.write(wav_path.replace(".wav", "_orig.wav"), y, sr)
+
+    y_fast = librosa.effects.time_stretch(y, rate=1.08)
+    y_fast = librosa.util.fix_length(y_fast, size=SR)
+    sf.write(wav_path.replace(".wav", "_fast.wav"), y_fast, sr)
+
+    y_slow = librosa.effects.time_stretch(y, rate=0.92)
+    y_slow = librosa.util.fix_length(y_slow, size=SR)
+    sf.write(wav_path.replace(".wav", "_slow.wav"), y_slow, sr)
+
+    y_noise = add_noise(y, level=0.004)
+    sf.write(wav_path.replace(".wav", "_noise.wav"), y_noise, sr)
+
+# 1. Створюємо базові записи
+base_samples = {word: [] for word in CLASSES}
+
+for word in CLASSES:
+    for i, tld in enumerate(TLDS):
+        base_wav = os.path.join(BASE_DIR, f"{word}_base_{i}.wav")
+        synthesize_base_word(word, base_wav, tld=tld, slow=(i == len(TLDS)-1))
+        base_samples[word].append(base_wav)
+
+# 2. Ділимо базові записи на train/val/test
+splits = {"train": [], "val": [], "test": []}
+
+for word in CLASSES:
+    files_word = base_samples[word][:]
+    random.shuffle(files_word)
+
+    n = len(files_word)
+    n_train = max(4, int(0.67 * n))
+    n_val = 1
+    n_test = n - n_train - n_val
+
+    train_files = files_word[:n_train]
+    val_files   = files_word[n_train:n_train+n_val]
+    test_files  = files_word[n_train+n_val:]
+
+    for split_name, subset in [("train", train_files), ("val", val_files), ("test", test_files)]:
+        for f in subset:
+            split_dir = os.path.join(BASE_DIR, split_name, word)
+            os.makedirs(split_dir, exist_ok=True)
+
+            target_base = os.path.join(split_dir, os.path.splitext(os.path.basename(f))[0])
+            save_augmented_versions(target_base + ".wav") if False else None  # заглушка
+
+            # копіюємо базовий файл у split і робимо аугментації вже всередині split
+            shutil.copy(f, target_base + ".wav")
+            save_augmented_versions(target_base + ".wav")
+            os.remove(target_base + ".wav")  # залишаємо тільки аугментовані версії
+
+print("Датасет сформовано.")
+
+for split_name in ["train", "val", "test"]:
+    total = 0
+    for word in CLASSES:
+        class_dir = os.path.join(BASE_DIR, split_name, word)
+        cnt = len(os.listdir(class_dir))
+        total += cnt
+        print(f"{split_name:5s} | {word:8s} -> {cnt}")
+    print(f"Усього {split_name}: {total}\n")
+
+def load_split(split_name):
+    X_list, y_list = [], []
+
+    for class_name in CLASSES:
+        class_dir = os.path.join(BASE_DIR, split_name, class_name)
+        for fname in os.listdir(class_dir):
+            if fname.endswith(".wav"):
+                fpath = os.path.join(class_dir, fname)
+
+                audio, sr = librosa.load(fpath, sr=SR)
+                audio = librosa.util.fix_length(audio, size=SR)
+
+                mel = librosa.feature.melspectrogram(
+                    y=audio, sr=sr, n_fft=512, hop_length=160, n_mels=64
+                )
+                mel_db = librosa.power_to_db(mel, ref=np.max).astype(np.float32)
+
+                X_list.append(mel_db)
+                y_list.append(CLASS_TO_ID[class_name])
+
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.int32)
+
+    idx = np.arange(len(X))
+    np.random.shuffle(idx)
+    X, y = X[idx], y[idx]
+
+    return X, y
+
+X_train, y_train = load_split("train")
+X_val, y_val = load_split("val")
+X_test, y_test = load_split("test")
+
+train_mean = X_train.mean()
+train_std = X_train.std() + 1e-8
+
+X_train = ((X_train - train_mean) / train_std)[..., np.newaxis]
+X_val   = ((X_val - train_mean) / train_std)[..., np.newaxis]
+X_test  = ((X_test - train_mean) / train_std)[..., np.newaxis]
+
+print("Train:", X_train.shape, y_train.shape)
+print("Val  :", X_val.shape, y_val.shape)
+print("Test :", X_test.shape, y_test.shape)
+
+unique, counts = np.unique(y_train, return_counts=True)
+print("\nРозподіл train:")
+for cls_id, cnt in zip(unique, counts):
+    print(ID_TO_CLASS[cls_id], cnt)
+
+plt.figure(figsize=(10, 4))
+plt.imshow(X_train[0].squeeze(), aspect="auto", origin="lower")
+plt.title(f"Приклад mel-спектрограми: клас = {ID_TO_CLASS[y_train[0]]}")
+plt.colorbar()
+plt.show()
+
+
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=X_train.shape[1:]),
+
+    tf.keras.layers.Conv2D(32, (3, 3), padding="same", activation="relu"),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.MaxPooling2D((2, 2)),
+
+    tf.keras.layers.Conv2D(64, (3, 3), padding="same", activation="relu"),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.MaxPooling2D((2, 2)),
+
+    tf.keras.layers.Conv2D(128, (3, 3), padding="same", activation="relu"),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.MaxPooling2D((2, 2)),
+
+    tf.keras.layers.Dropout(0.4),
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(128, activation="relu"),
+    tf.keras.layers.Dropout(0.4),
+    tf.keras.layers.Dense(len(CLASSES), activation="softmax")
+])
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor="val_accuracy",
+        patience=5,
+        restore_best_weights=True
+    )
+]
+
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=25,
+    batch_size=16,
+    callbacks=callbacks,
+    verbose=1
+)
+
+test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
+print(f"\nTest accuracy: {test_acc:.4f}")
+
+pred = model.predict(X_test[:20], verbose=0)
+pred_ids = np.argmax(pred, axis=1)
+
+print("\nПрогноз:", [ID_TO_CLASS[i] for i in pred_ids])
+print("Правда :", [ID_TO_CLASS[i] for i in y_test[:20]])
+
+plt.figure(figsize=(12, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(history.history["accuracy"], label="train")
+plt.plot(history.history["val_accuracy"], label="val")
+plt.title("Accuracy")
+plt.xlabel("Epoch")
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history["loss"], label="train")
+plt.plot(history.history["val_loss"], label="val")
+plt.title("Loss")
+plt.xlabel("Epoch")
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+def center_pad_to_1s(audio_np, target_len=SR):
+    audio_np = np.asarray(audio_np, dtype=np.float32)
+
+    if len(audio_np) >= target_len:
+        start = (len(audio_np) - target_len) // 2
+        return audio_np[start:start + target_len]
+
+    pad_total = target_len - len(audio_np)
+    pad_left = pad_total // 2
+    pad_right = pad_total - pad_left
+    return np.pad(audio_np, (pad_left, pad_right), mode="constant")
+
+def predict_audio_array(audio, sr=SR):
+    audio = center_pad_to_1s(audio, SR)
+
+    mel = librosa.feature.melspectrogram(
+        y=audio, sr=sr, n_fft=512, hop_length=160, n_mels=64
+    )
+    mel_db = librosa.power_to_db(mel, ref=np.max).astype(np.float32)
+
+    mel_db = (mel_db - train_mean) / train_std
+    inp = mel_db[np.newaxis, ..., np.newaxis]
+
+    probs = model.predict(inp, verbose=0)[0]
+    pred_id = int(np.argmax(probs))
+    pred_word = ID_TO_CLASS[pred_id]
+    pred_token = WORD_TO_TOKEN[pred_word]
+    conf = float(np.max(probs))
+
+    return pred_word, pred_token, conf
+
+def generate_sequence_audio(words, out_path="/content/test_sequence.wav", pause_ms=650, tld="com"):
+    combined = AudioSegment.silent(duration=400)
+
+    for w in words:
+        temp_mp3 = f"/content/{w}.mp3"
+        temp_wav = f"/content/{w}.wav"
+
+        tts = gTTS(text=w, lang="en", tld=tld, slow=False)
+        tts.save(temp_mp3)
+
+        seg = AudioSegment.from_mp3(temp_mp3).set_channels(1).set_frame_rate(SR)
+
+        if len(seg) > 900:
+            seg = seg[:900]
+
+        seg = AudioSegment.silent(duration=100) + seg + AudioSegment.silent(duration=100)
+        seg.export(temp_wav, format="wav")
+        seg = AudioSegment.from_wav(temp_wav)
+
+        combined += seg + AudioSegment.silent(duration=pause_ms)
+
+        os.remove(temp_mp3)
+        os.remove(temp_wav)
+
+    combined.export(out_path, format="wav")
+    return out_path
+
+def split_sequence_file(file_path, min_silence_len=300, silence_thresh_offset=20, keep_silence=250):
+    audio = AudioSegment.from_wav(file_path)
+
+    chunks = split_on_silence(
+        audio,
+        min_silence_len=min_silence_len,
+        silence_thresh=audio.dBFS - silence_thresh_offset,
+        keep_silence=keep_silence
+    )
+    return chunks
+
+# 1. Перевірка на нових окремих словах
+print("Перевірка на нових окремих словах:")
+single_words = ["kilo", "charlie", "foxtrot", "two", "three"]
+
+for w in single_words:
+    temp_mp3 = f"/content/test_{w}.mp3"
+    temp_wav = f"/content/test_{w}.wav"
+
+    tts = gTTS(text=w, lang="en", tld="com", slow=False)
+    tts.save(temp_mp3)
+
+    seg = AudioSegment.from_mp3(temp_mp3).set_channels(1).set_frame_rate(SR)
+    seg.export(temp_wav, format="wav")
+
+    y_word, sr_word = librosa.load(temp_wav, sr=SR)
+    pred_word, pred_token, conf = predict_audio_array(y_word, sr_word)
+
+    print(f"word={w:8s} -> pred={pred_word:8s} token={pred_token:2s} conf={conf:.4f}")
+
+    os.remove(temp_mp3)
+    os.remove(temp_wav)
+
+# 2. Один багатослівний файл
+test_words = ["kilo", "charlie", "foxtrot", "two", "three"]
+test_file = generate_sequence_audio(test_words, "/content/test_sequence.wav", pause_ms=650)
+
+print("\nЗгенерований тестовий файл:")
+display(Audio(test_file))
+
+chunks = split_sequence_file(test_file)
+print(f"Знайдено сегментів: {len(chunks)}")
+
+results = []
+for i, chunk in enumerate(chunks):
+    chunk_path = f"/content/chunk_{i:02d}.wav"
+    chunk.export(chunk_path, format="wav")
+
+    y_chunk, sr_chunk = librosa.load(chunk_path, sr=SR)
+    print(f"segment {i:02d}: duration = {len(y_chunk)/sr_chunk:.3f} sec")
+
+    pred_word, pred_token, conf = predict_audio_array(y_chunk, sr_chunk)
+    results.append((i, pred_word, pred_token, conf))
+
+print("\nРезультати розпізнавання:")
+for i, pred_word, pred_token, conf in results:
+    print(f"segment {i:02d} -> word={pred_word:8s} token={pred_token:2s} conf={conf:.4f}")
+
+final_code = "".join([item[2] for item in results])
+
+print("\nОчікувана послідовність слів:")
+print(test_words)
+
+print("\nПідсумковий код:")
+print(final_code)
